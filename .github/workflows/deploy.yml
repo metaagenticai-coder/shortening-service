@@ -1,0 +1,187 @@
+name: Deploy to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: us-central1
+  DOCKER_REGISTRY: gcr.io
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+      - name: Build and push shortening-service
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deployments/docker/Dockerfile.shortening
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/shortening-service:${{ steps.version.outputs.VERSION }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/shortening-service:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push redirect-service
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deployments/docker/Dockerfile.redirect
+          push: true
+          tags: |
+            ${{ env.DOCKER_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/redirect-service:${{ steps.version.outputs.VERSION }}
+            ${{ env.DOCKER_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/redirect-service:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' || github.event.inputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://shortening-staging.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy shortening-service to Cloud Run
+        run: |
+          gcloud run deploy shortening-service-staging \
+            --image=${{ env.DOCKER_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/shortening-service:${{ needs.build-and-push.outputs.version }} \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --allow-unauthenticated \
+            --set-env-vars="ENVIRONMENT=staging" \
+            --min-instances=1 \
+            --max-instances=10 \
+            --cpu=1 \
+            --memory=512Mi \
+            --timeout=10s \
+            --concurrency=80
+
+      - name: Deploy redirect-service to Cloud Run
+        run: |
+          gcloud run deploy redirect-service-staging \
+            --image=${{ env.DOCKER_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/redirect-service:${{ needs.build-and-push.outputs.version }} \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --allow-unauthenticated \
+            --set-env-vars="ENVIRONMENT=staging" \
+            --min-instances=1 \
+            --max-instances=10 \
+            --cpu=1 \
+            --memory=256Mi \
+            --timeout=5s \
+            --concurrency=250
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event.inputs.environment == 'production'
+    environment:
+      name: production
+      url: https://short.link
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy shortening-service to Cloud Run
+        run: |
+          gcloud run deploy shortening-service \
+            --image=${{ env.DOCKER_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/shortening-service:${{ needs.build-and-push.outputs.version }} \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --allow-unauthenticated \
+            --set-env-vars="ENVIRONMENT=production" \
+            --min-instances=2 \
+            --max-instances=100 \
+            --cpu=1 \
+            --memory=512Mi \
+            --timeout=10s \
+            --concurrency=80
+
+      - name: Deploy redirect-service to Cloud Run
+        run: |
+          gcloud run deploy redirect-service \
+            --image=${{ env.DOCKER_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/redirect-service:${{ needs.build-and-push.outputs.version }} \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --allow-unauthenticated \
+            --set-env-vars="ENVIRONMENT=production" \
+            --min-instances=5 \
+            --max-instances=500 \
+            --cpu=1 \
+            --memory=256Mi \
+            --timeout=5s \
+            --concurrency=250
+
+      - name: Verify deployment
+        run: |
+          echo "Shortening service URL:"
+          gcloud run services describe shortening-service --region=${{ env.GCP_REGION }} --format='value(status.url)'
+          echo "Redirect service URL:"
+          gcloud run services describe redirect-service --region=${{ env.GCP_REGION }} --format='value(status.url)'
