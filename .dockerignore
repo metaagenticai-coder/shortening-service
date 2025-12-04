@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+
+# Documentation
+README.md
+*.md
+
+# Build artifacts
+bin/
+dist/
+build/
+
+# Test files
+*_test.go
+testdata/
+
+# Development files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Coverage
+coverage.out
+coverage.html
+
+# Temporary
+tmp/
+temp/
+
+# Docker
+docker-compose.yml
+Dockerfile*
+.dockerignore
+
+# CI/CD
+.github/
+
+# Scripts (not needed in container)
+scripts/

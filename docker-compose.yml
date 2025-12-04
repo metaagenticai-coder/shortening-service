@@ -1,0 +1,95 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: shortening-postgres
+    environment:
+      POSTGRES_DB: url_shortener
+      POSTGRES_USER: shortener
+      POSTGRES_PASSWORD: shortener_dev_password
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortener -d url_shortener"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - shortening-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: shortening-redis
+    command: redis-server --appendonly yes --requirepass redis_dev_password
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - shortening-network
+
+  shortening-service:
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile.shortening
+    container_name: shortening-service
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://shortener:shortener_dev_password@postgres:5432/url_shortener?sslmode=disable
+      REDIS_URL: redis://:redis_dev_password@redis:6379/0
+      SHORT_DOMAIN: localhost:8080
+      LOG_LEVEL: debug
+      RATE_LIMIT_PER_IP: 100
+      WORKER_ID: 1
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - shortening-network
+    restart: unless-stopped
+
+  redirect-service:
+    build:
+      context: .
+      dockerfile: deployments/docker/Dockerfile.redirect
+    container_name: redirect-service
+    environment:
+      PORT: 8081
+      DATABASE_URL: postgres://shortener:shortener_dev_password@postgres:5432/url_shortener?sslmode=disable
+      REDIS_URL: redis://:redis_dev_password@redis:6379/0
+      CACHE_TTL: 3600
+      LOG_LEVEL: debug
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - shortening-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  shortening-network:
+    driver: bridge
