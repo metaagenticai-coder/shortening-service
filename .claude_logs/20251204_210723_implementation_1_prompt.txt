@@ -1,0 +1,2113 @@
+
+# Role: Software Development Engineer
+
+You are a Software Development Engineer responsible for implementing code according to specifications.
+
+## Responsibilities:
+- Write clean, maintainable code following best practices
+- Implement API interfaces as specified in service documents
+- Create data models and database schemas
+- Implement business logic with proper error handling
+- Write unit tests for all implemented functionality
+- Follow the tech stack and patterns specified in architecture
+
+## Guidelines:
+- Follow SOLID principles
+- Write self-documenting code with clear variable and function names
+- Add comments only where logic is not self-evident
+- Handle errors gracefully with appropriate error types
+- Include input validation at API boundaries
+- Write comprehensive unit tests with good coverage
+- Follow the project's existing code style and patterns
+
+## Task Types You Handle:
+- repo-setup: Initialize repository with proper structure
+- project-structure: Set up project scaffolding and dependencies
+- interfaces: Implement API endpoints and interfaces
+- data-model: Create database models and schemas
+- business-logic: Implement core business logic
+- unit-tests: Write unit tests for implemented features
+
+
+# Task Context
+## Task Description
+# Task: Redis Client Setup
+
+## Metadata
+- slug: 006-redis-client
+- type: interfaces
+
+## Goal
+
+Implement Redis client using go-redis/v9 for rate limiting and optional caching with connection pooling and health checks.
+
+## Dependencies
+
+- [ ] `tasks/shortening-service/003-config-management.md` - Redis config needed
+- [ ] `tasks/shortening-service/004-logging-setup.md` - Logging needed
+
+## Context
+
+- Service Doc: `services/shortening-service.md`
+- Architecture: `architecture/architecture.md`
+## Service Specification
+# Service Specification: shortening-service
+
+## Overview
+
+The `shortening-service` is a high-performance URL shortening API service responsible for accepting long URLs, validating them, generating unique short codes, and persisting URL mappings to a PostgreSQL database. The service is designed to handle 1,000 requests per second with p99 latency under 200ms, implementing rate limiting and input sanitization to prevent abuse. It operates as a write-optimized service in a read-heavy architecture, where the companion `redirect-service` handles the majority of traffic.
+
+## Tech Stack
+
+- **Language:** Go 1.21+
+- **Framework:** Chi v5 (lightweight HTTP router)
+- **Database:** PostgreSQL 15 (Cloud SQL with High Availability)
+- **Cache:** Redis 7.0 (Memorystore) - for rate limiting and optional cache invalidation
+- **Container Runtime:** Cloud Run (serverless containers)
+- **Libraries:**
+  - `go-chi/chi/v5` - HTTP routing and middleware
+  - `go-chi/cors` - CORS middleware
+  - `jackc/pgx/v5` - PostgreSQL driver and connection pooling
+  - `go-redis/redis/v9` - Redis client for rate limiting
+  - `golang.org/x/time/rate` - Token bucket rate limiter
+  - `google.golang.org/api/idtoken` - Future authentication support
+  - `rs/zerolog` - Structured JSON logging
+  - `prometheus/client_golang` - Metrics instrumentation
+
+---
+
+## APIs/Interfaces
+
+### POST /api/v1/shorten
+
+**Description:** Accepts a long URL, validates it, generates a unique short code, stores the mapping in PostgreSQL, and returns the shortened URL details.
+
+**Request Headers:**
+```
+Content-Type: application/json
+X-Forwarded-For: <client-ip> (for rate limiting)
+```
+
+**Request Body:**
+```json
+{
+  "url": "https://example.com/very/long/url/path?query=params&more=data"
+}
+```
+
+**Request Schema:**
+| Field | Type | Required | Constraints | Description |
+|-------|------|----------|-------------|-------------|
+| url | string | Yes | 10-2048 chars, http/https only | The long URL to shorten |
+
+**Response (201 Created):**
+```json
+{
+  "short_code": "aB3xY9",
+  "short_url": "https://short.link/aB3xY9",
+  "long_url": "https://example.com/very/long/url/path?query=params&more=data",
+  "created_at": "2024-01-15T10:30:00.123Z"
+}
+```
+
+**Response (400 Bad Request - Invalid URL):**
+```json
+{
+  "error": "invalid_url",
+  "message": "URL must start with http:// or https://",
+  "details": {
+    "field": "url",
+    "provided": "ftp://example.com"
+  }
+}
+```
+
+**Response (400 Bad Request - Missing URL):**
+```json
+{
+  "error": "validation_error",
+  "message": "URL field is required",
+  "details": {
+    "field": "url",
+    "constraint": "required"
+  }
+}
+```
+
+**Response (400 Bad Request - URL Too Long):**
+```json
+{
+  "error": "validation_error",
+  "message": "URL exceeds maximum length of 2048 characters",
+  "details": {
+    "field": "url",
+    "constraint": "max_length",
+    "max_length": 2048,
+    "provided_length": 3000
+  }
+}
+```
+
+**Response (400 Bad Request - Invalid Domain):**
+```json
+{
+  "error": "invalid_url",
+  "message": "URL contains invalid domain",
+  "details": {
+    "field": "url",
+    "reason": "domain_not_resolvable"
+  }
+}
+```
+
+**Response (429 Too Many Requests):**
+```json
+{
+  "error": "rate_limit_exceeded",
+  "message": "Too many requests. Please try again later.",
+  "retry_after": 60,
+  "limit": 100,
+  "window": "1 minute"
+}
+```
+
+**Response (500 Internal Server Error):**
+```json
+{
+  "error": "internal_error",
+  "message": "An unexpected error occurred. Please try again.",
+  "request_id": "req-abc123-def456"
+}
+```
+
+**Response (503 Service Unavailable):**
+```json
+{
+  "error": "service_unavailable",
+  "message": "Database temporarily unavailable. Please try again.",
+  "request_id": "req-abc123-def456"
+}
+```
+
+**Business Logic:**
+
+**Happy Path:**
+1. Request arrives with valid JSON body containing `url` field
+2. Extract client IP from `X-Forwarded-For` header for rate limiting
+3. Check rate limit: 100 requests per minute per IP address
+4. Validate URL format:
+   - Must start with `http://` or `https://`
+   - Must be between 10 and 2048 characters
+   - Must contain valid domain (basic DNS validation)
+   - Must not contain dangerous schemes (javascript:, data:, file:)
+5. Generate unique short code using Snowflake-inspired algorithm:
+   - 41 bits: Timestamp (milliseconds since custom epoch)
+   - 10 bits: Worker ID (derived from Cloud Run instance ID)
+   - 12 bits: Sequence number (incremented for same millisecond)
+   - Result: 63-bit integer encoded to Base62 (6-8 characters)
+6. Insert URL mapping into PostgreSQL:
+   - short_code (unique constraint ensures no collisions)
+   - long_url
+   - created_at (automatic timestamp)
+   - created_by_ip (for abuse tracking)
+7. Return 201 Created with shortened URL details
+8. Log successful operation with structured logging
+9. Increment Prometheus metrics: `shortening_requests_total{status="success"}`
+
+**Sad Path - Validation Failures:**
+1. Missing `url` field → Return 400 with `validation_error`
+2. Empty `url` string → Return 400 with `validation_error`
+3. URL too short (< 10 chars) → Return 400 with `validation_error`
+4. URL too long (> 2048 chars) → Return 400 with `validation_error`
+5. Invalid scheme (not http/https) → Return 400 with `invalid_url`
+6. Malformed URL (no domain, invalid characters) → Return 400 with `invalid_url`
+7. Dangerous schemes detected (javascript:, data:) → Return 400 with `invalid_url` and log security event
+8. Rate limit exceeded → Return 429 with `Retry-After` header
+9. Log validation failure with reason
+10. Increment Prometheus metrics: `shortening_requests_total{status="validation_error"}`
+
+**Sad Path - Database Failures:**
+1. PostgreSQL connection pool exhausted → Return 503 with `service_unavailable`
+2. Database connection timeout → Return 503 with `service_unavailable`
+3. Unique constraint violation (collision, extremely rare) → Retry short code generation (max 3 attempts), then return 500
+4. Database write timeout → Return 503 with `service_unavailable`
+5. Log error with full context (request_id, error details)
+6. Increment Prometheus metrics: `shortening_requests_total{status="database_error"}`
+7. Trigger Cloud Monitoring alert if error rate exceeds threshold
+
+**Edge Cases:**
+
+1. **Duplicate URL Submission:**
+   - Behavior: Generate new short code each time (no deduplication in MVP)
+   - Rationale: Simplifies logic, avoids privacy concerns
+   - Future: Optional deduplication with user accounts
+
+2. **URL with Fragments:**
+   - Example: `https://example.com/page#section`
+   - Behavior: Store entire URL including fragment
+   - Redirect service will preserve fragment
+
+3. **URL with Special Characters:**
+   - Example: `https://example.com/path?q=hello%20world&lang=en`
+   - Behavior: Store URL as-provided (already encoded)
+   - Validation: Ensure proper percent-encoding
+
+4. **International Domain Names (IDN):**
+   - Example: `https://münchen.de/path`
+   - Behavior: Accept Punycode-encoded domains
+   - Validation: Basic format check only
+
+5. **Very Short URLs:**
+   - Example: `https://t.co`
+   - Behavior: Accept if >= 10 characters total
+   - Rationale: Prevent abuse, ensure minimum URL validity
+
+6. **URLs with Authentication:**
+   - Example: `https://user:pass@example.com/path`
+   - Behavior: Accept and store as-is
+   - Security: Log warning (potential credential exposure)
+
+7. **Localhost/Private IPs:**
+   - Example: `http://localhost:8080` or `http://192.168.1.1`
+   - Behavior: Accept (no DNS validation for MVP)
+   - Future: Optional blocking of private IP ranges
+
+8. **Concurrent Requests with Same URL:**
+   - Behavior: Each request generates unique short code
+   - Database: Handles concurrent writes with MVCC
+
+9. **Short Code Collision (Theoretical):**
+   - Probability: < 1 in 1 billion with 63-bit space
+   - Handling: Retry generation up to 3 times
+   - Fallback: Return 500 and alert engineering team
+
+10. **Request with Extra Fields:**
+    - Example: `{"url": "...", "custom_code": "abc"}`
+    - Behavior: Ignore extra fields, process only `url`
+    - Future: Support custom codes with authentication
+
+---
+
+### GET /health
+
+**Description:** Health check endpoint for load balancer and monitoring. Returns service health status and dependency connectivity.
+
+**Request:** None (no body or query parameters)
+
+**Response (200 OK):**
+```json
+{
+  "status": "healthy",
+  "service": "shortening-service",
+  "version": "1.0.0",
+  "timestamp": "2024-01-15T10:30:00.123Z",
+  "checks": {
+    "database": "healthy",
+    "redis": "healthy"
+  }
+}
+```
+
+**Response (503 Service Unavailable):**
+```json
+{
+  "status": "unhealthy",
+  "service": "shortening-service",
+  "version": "1.0.0",
+  "timestamp": "2024-01-15T10:30:00.123Z",
+  "checks": {
+    "database": "unhealthy",
+    "redis": "healthy"
+  },
+  "errors": [
+    "PostgreSQL connection failed: timeout"
+  ]
+}
+```
+
+**Business Logic:**
+
+**Happy Path:**
+1. Perform lightweight database ping (SELECT 1)
+2. Perform Redis ping
+3. Check response times (< 100ms for each)
+4. Return 200 OK if all checks pass
+5. Used by Cloud Run for liveness probes
+
+**Sad Path:**
+1. Database ping fails → Mark as unhealthy
+2. Redis ping fails → Mark as unhealthy (non-critical)
+3. Return 503 if database is unhealthy
+4. Cloud Run will restart container after multiple failures
+
+**Edge Cases:**
+- Slow database response (> 100ms) → Log warning but return healthy
+- Redis unavailable → Return healthy (Redis is not critical for shortening)
+
+---
+
+### GET /ready
+
+**Description:** Readiness check endpoint for load balancer. Indicates whether service is ready to accept traffic.
+
+**Request:** None
+
+**Response (200 OK):**
+```json
+{
+  "status": "ready",
+  "service": "shortening-service",
+  "timestamp": "2024-01-15T10:30:00.123Z"
+}
+```
+
+**Response (503 Service Unavailable):**
+```json
+{
+  "status": "not_ready",
+  "service": "shortening-service",
+  "timestamp": "2024-01-15T10:30:00.123Z",
+  "reason": "database_not_ready"
+}
+```
+
+**Business Logic:**
+
+**Happy Path:**
+1. Check database connection pool has available connections
+2. Verify service has completed initialization
+3. Return 200 OK if ready to serve traffic
+4. Used by load balancer for readiness probes
+
+**Sad Path:**
+1. Service still initializing → Return 503
+2. Database connection pool not initialized → Return 503
+3. Load balancer will not route traffic until ready
+
+---
+
+### GET /metrics
+
+**Description:** Prometheus metrics endpoint for monitoring and alerting.
+
+**Request:** None
+
+**Response (200 OK):**
+```
+# HELP shortening_requests_total Total number of shortening requests
+# TYPE shortening_requests_total counter
+shortening_requests_total{status="success"} 12543
+shortening_requests_total{status="validation_error"} 234
+shortening_requests_total{status="rate_limit"} 89
+shortening_requests_total{status="database_error"} 3
+
+# HELP shortening_latency_seconds Request latency distribution
+# TYPE shortening_latency_seconds histogram
+shortening_latency_seconds_bucket{le="0.01"} 8932
+shortening_latency_seconds_bucket{le="0.05"} 12234
+shortening_latency_seconds_bucket{le="0.1"} 12456
+shortening_latency_seconds_bucket{le="0.2"} 12543
+shortening_latency_seconds_sum 892.34
+shortening_latency_seconds_count 12543
+
+# HELP short_codes_generated_total Total short codes generated
+# TYPE short_codes_generated_total counter
+short_codes_generated_total 12543
+
+# HELP rate_limit_hits_total Total rate limit rejections
+# TYPE rate_limit_hits_total counter
+rate_limit_hits_total 89
+
+# HELP db_connections_active Active database connections
+# TYPE db_connections_active gauge
+db_connections_active 8
+
+# HELP db_connections_max Maximum database connections
+# TYPE db_connections_max gauge
+db_connections_max 20
+```
+
+**Business Logic:**
+- Expose Prometheus-compatible metrics
+- Scraped by Cloud Monitoring
+- Used for dashboards and alerting
+
+---
+
+## Data Model
+
+### Entity: url_mappings
+
+Primary table storing the mapping between short codes and long URLs.
+
+| Field | Type | Constraints | Description |
+|-------|------|-------------|-------------|
+| id | BIGSERIAL | PRIMARY KEY | Auto-incrementing unique identifier |
+| short_code | VARCHAR(8) | UNIQUE NOT NULL | Base62-encoded short code (6-8 chars) |
+| long_url | TEXT | NOT NULL | Original long URL (up to 2048 chars) |
+| created_at | TIMESTAMP WITH TIME ZONE | NOT NULL DEFAULT NOW() | Creation timestamp (UTC) |
+| created_by_ip | INET | NULLABLE | Client IP address for abuse tracking |
+
+**Indexes:**
+```sql
+CREATE UNIQUE INDEX idx_short_code ON url_mappings(short_code);
+CREATE INDEX idx_created_at ON url_mappings(created_at DESC);
+CREATE INDEX idx_created_by_ip ON url_mappings(created_by_ip) WHERE created_by_ip IS NOT NULL;
+```
+
+**Constraints:**
+```sql
+ALTER TABLE url_mappings 
+  ADD CONSTRAINT short_code_length 
+  CHECK (char_length(short_code) BETWEEN 6 AND 8);
+
+ALTER TABLE url_mappings 
+  ADD CONSTRAINT long_url_length 
+  CHECK (char_length(long_url) BETWEEN 10 AND 2048);
+
+ALTER TABLE url_mappings 
+  ADD CONSTRAINT long_url_scheme 
+  CHECK (long_url LIKE 'http://%' OR long_url LIKE 'https://%');
+```
+
+**Table Creation DDL:**
+```sql
+CREATE TABLE url_mappings (
+    id BIGSERIAL PRIMARY KEY,
+    short_code VARCHAR(8) UNIQUE NOT NULL,
+    long_url TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL,
+    created_by_ip INET,
+    
+    CONSTRAINT short_code_length CHECK (char_length(short_code) BETWEEN 6 AND 8),
+    CONSTRAINT long_url_length CHECK (char_length(long_url) BETWEEN 10 AND 2048),
+    CONSTRAINT long_url_scheme CHECK (long_url LIKE 'http://%' OR long_url LIKE 'https://%')
+);
+
+CREATE UNIQUE INDEX idx_short_code ON url_mappings(short_code);
+CREATE INDEX idx_created_at ON url_mappings(created_at DESC);
+CREATE INDEX idx_created_by_ip ON url_mappings(created_by_ip) WHERE created_by_ip IS NOT NULL;
+```
+
+### Relationships
+
+**No foreign key relationships in MVP.**
+
+**Future Enhancements:**
+- `users` table → `url_mappings.user_id` (for authenticated users)
+- `url_analytics` table → `url_mappings.id` (for click tracking)
+- `url_tags` table → many-to-many with `url_mappings` (for categorization)
+
+### Data Access Patterns
+
+**Write Pattern (Shortening Service):**
+```sql
+-- Insert new URL mapping
+INSERT INTO url_mappings (short_code, long_url, created_by_ip)
+VALUES ($1, $2, $3)
+RETURNING id, short_code, long_url, created_at;
+```
+
+**Read Pattern (Redirect Service - via replica):**
+```sql
+-- Lookup URL by short code
+SELECT long_url FROM url_mappings WHERE short_code = $1;
+```
+
+**Abuse Detection Query:**
+```sql
+-- Count recent URLs from same IP
+SELECT COUNT(*) FROM url_mappings
+WHERE created_by_ip = $1 
+  AND created_at > NOW() - INTERVAL '1 hour';
+```
+
+### Database Configuration
+
+**Connection Pooling:**
+```go
+// pgx connection pool configuration
+poolConfig := &pgxpool.Config{
+    MaxConns:          20,  // Maximum connections
+    MinConns:          5,   // Minimum idle connections
+    MaxConnLifetime:   time.Hour,
+    MaxConnIdleTime:   time.Minute * 30,
+    HealthCheckPeriod: time.Minute,
+}
+```
+
+**Cloud SQL Configuration:**
+- **Instance Type:** db-custom-2-8192 (2 vCPU, 8GB RAM)
+- **High Availability:** Enabled (automatic failover)
+- **Backups:** Automated daily at 03:00 UTC, 7-day retention
+- **Point-in-Time Recovery:** Enabled
+- **Maintenance Window:** Sunday 02:00-06:00 UTC
+- **Connection:** Private IP via Serverless VPC Connector
+- **SSL/TLS:** Required for all connections
+
+**PostgreSQL Settings:**
+```sql
+-- Performance tuning
+max_connections = 200
+shared_buffers = 2GB
+effective_cache_size = 6GB
+maintenance_work_mem = 512MB
+checkpoint_completion_target = 0.9
+wal_buffers = 16MB
+default_statistics_target = 100
+random_page_cost = 1.1
+effective_io_concurrency = 200
+work_mem = 20MB
+min_wal_size = 1GB
+max_wal_size = 4GB
+```
+
+---
+
+## Short Code Generation Algorithm
+
+### Snowflake-Inspired Distributed ID Generation
+
+**Algorithm Overview:**
+
+The service generates unique 63-bit integers using a Snowflake-inspired approach, then encodes them to Base62 for URL-friendly short codes.
+
+**Bit Layout (63 bits total):**
+```
+┌─────────────────────────────────────────────────────────────┐
+│  41 bits: Timestamp  │ 10 bits: Worker ID │ 12 bits: Sequence │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Components:**
+
+1. **Timestamp (41 bits):**
+   - Milliseconds since custom epoch: 2024-01-01 00:00:00 UTC
+   - Range: ~69 years from epoch
+   - Ensures time-based ordering
+
+2. **Worker ID (10 bits):**
+   - Derived from Cloud Run instance metadata
+   - Range: 0-1023 (supports 1024 concurrent instances)
+   - Extracted from `CLOUD_RUN_INSTANCE_ID` environment variable
+   - Fallback: Hash of hostname if env var unavailable
+
+3. **Sequence (12 bits):**
+   - Counter for IDs generated in same millisecond
+   - Range: 0-4095 (4096 IDs per millisecond per worker)
+   - Resets to 0 when timestamp increments
+   - If sequence exhausted, wait for next millisecond
+
+**Capacity:**
+- **Per Worker:** 4,096 IDs per millisecond = 4,096,000 IDs per second
+- **Total (1024 workers):** 4.2 billion IDs per second
+- **Total Space:** 2^63 = 9.2 quintillion unique IDs
+
+**Base62 Encoding:**
+
+Character set: `0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ`
+
+```
+63-bit integer → Base62 encode → 6-8 character string
+
+Examples:
+1234567890123 → "dnh5xN7"  (7 chars)
+9876543210987 → "2BiIEk3"  (7 chars)
+```
+
+**Implementation Pseudocode:**
+
+```go
+type SnowflakeGenerator struct {
+    workerID      uint16
+    sequence      uint16
+    lastTimestamp int64
+    mutex         sync.Mutex
+}
+
+func (g *SnowflakeGenerator) Generate() (int64, error) {
+    g.mutex.Lock()
+    defer g.mutex.Unlock()
+    
+    timestamp := currentMillis() - EPOCH_OFFSET
+    
+    if timestamp < g.lastTimestamp {
+        // Clock moved backwards
+        return 0, ErrClockMovedBackwards
+    }
+    
+    if timestamp == g.lastTimestamp {
+        // Same millisecond - increment sequence
+        g.sequence = (g.sequence + 1) & 0xFFF
+        if g.sequence == 0 {
+            // Sequence exhausted - wait for next millisecond
+            timestamp = waitNextMillis(g.lastTimestamp)
+        }
+    } else {
+        // New millisecond - reset sequence
+        g.sequence = 0
+    }
+    
+    g.lastTimestamp = timestamp
+    
+    // Combine components into 63-bit ID
+    id := (timestamp << 22) | (int64(g.workerID) << 12) | int64(g.sequence)
+    
+    return id, nil
+}
+
+func Base62Encode(num int64) string {
+    const charset = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if num == 0 {
+        return "0"
+    }
+    
+    result := ""
+    for num > 0 {
+        result = string(charset[num%62]) + result
+        num /= 62
+    }
+    return result
+}
+```
+
+**Collision Handling:**
+
+1. **Primary Prevention:** Unique worker IDs and sequence numbers ensure no collisions
+2. **Database Constraint:** `UNIQUE` constraint on `short_code` column
+3. **Retry Logic:** If constraint violation occurs (extremely rare):
+   - Regenerate new ID (max 3 attempts)
+   - Log collision event for investigation
+   - Return 500 error if all retries fail
+
+**Edge Cases:**
+
+1. **Clock Skew:**
+   - If system clock moves backwards, reject ID generation
+   - Return error and log critical alert
+   - Prevent duplicate IDs from being generated
+
+2. **Worker ID Collision:**
+   - Multiple instances get same worker ID (misconfiguration)
+   - Database constraint prevents duplicate short codes
+   - Monitoring alerts on high constraint violation rate
+
+3. **Sequence Exhaustion:**
+   - More than 4096 requests in single millisecond on one worker
+   - Generator waits for next millisecond (adds ~1ms latency)
+   - Extremely rare with proper load balancing
+
+---
+
+## Rate Limiting Strategy
+
+### Token Bucket Algorithm
+
+**Configuration:**
+
+```go
+type RateLimitConfig struct {
+    // Per-IP limits
+    PerIPRate     int           // 100 requests
+    PerIPBurst    int           // 120 requests (allows small bursts)
+    PerIPWindow   time.Duration // 1 minute
+    
+    // Global limits
+    GlobalRate    int           // 1000 requests
+    GlobalBurst   int           // 1200 requests
+    GlobalWindow  time.Duration // 1 second
+}
+```
+
+**Implementation:**
+
+**Storage:** Redis (Memorystore) with TTL-based keys
+
+**Per-IP Rate Limiting:**
+```
+Redis Key: "ratelimit:ip:{ip_address}"
+Redis Value: Token count (integer)
+Redis TTL: 60 seconds
+
+Algorithm:
+1. GET current token count for IP
+2. If key doesn't exist, initialize with max tokens (100)
+3. If tokens > 0, decrement by 1 and allow request
+4. If tokens == 0, reject with 429 Too Many Requests
+5. Tokens refill at rate of 100 per minute (1.67 per second)
+```
+
+**Global Rate Limiting:**
+```
+Redis Key: "ratelimit:global"
+Redis Value: Token count (integer)
+Redis TTL: 1 second
+
+Algorithm:
+1. GET current global token count
+2. If key doesn't exist, initialize with max tokens (1000)
+3. If tokens > 0, decrement by 1 and allow request
+4. If tokens == 0, reject with 429 Too Many Requests
+5. Tokens refill at rate of 1000 per second
+```
+
+**Response Headers:**
+```
+X-RateLimit-Limit: 100
+X-RateLimit-Remaining: 73
+X-RateLimit-Reset: 1705315860
+Retry-After: 47 (seconds until reset)
+```
+
+**Error Response (429):**
+```json
+{
+  "error": "rate_limit_exceeded",
+  "message": "Too many requests. Please try again later.",
+  "retry_after": 47,
+  "limit": 100,
+  "window": "1 minute"
+}
+```
+
+**Bypass Logic:**
+
+```go
+// Future: Allow authenticated requests to bypass rate limits
+if request.HasValidAPIKey() {
+    // Skip rate limit check
+    return next(w, r)
+}
+```
+
+**Monitoring:**
+- Metric: `rate_limit_hits_total` (counter)
+- Alert: If rate limit hits > 10% of total requests, investigate abuse
+- Log: IP addresses that hit rate limit for abuse tracking
+
+---
+
+## GCP Resources
+
+### Cloud Run Service
+
+**Service Configuration:**
+
+```yaml
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: shortening-service
+  namespace: default
+  labels:
+    app: url-shortener
+    component: shortening-service
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "2"
+        autoscaling.knative.dev/maxScale: "100"
+        autoscaling.knative.dev/target: "80"
+        run.googleapis.com/vpc-access-connector: url-shortener-connector
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 10
+      serviceAccountName: shortening-service@PROJECT.iam.gserviceaccount.com
+      containers:
+      - name: shortening-service
+        image: gcr.io/PROJECT/shortening-service:latest
+        ports:
+        - name: http1
+          containerPort: 8080
+        env:
+        - name: PORT
+          value: "8080"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: database-url
+              key: latest
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: redis-url
+              key: latest
+        - name: SHORT_DOMAIN
+          value: "short.link"
+        - name: WORKER_ID
+          value: "auto"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: ENVIRONMENT
+          value: "production"
+        resources:
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+          requests:
+            cpu: "500m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 2
+```
+
+**Resource Specifications:**
+
+| Resource | Value | Rationale |
+|----------|-------|-----------|
+| Min Instances | 2 | Ensure availability, reduce cold starts |
+| Max Instances | 100 | Handle peak load (1000 req/s ÷ 10 req/s per instance) |
+| CPU | 1 vCPU | Sufficient for JSON parsing, DB writes |
+| Memory | 512 Mi | Adequate for connection pools and buffers |
+| Concurrency | 80 | Balance throughput and latency |
+| Timeout | 10s | Generous for DB writes, prevent hung requests |
+
+**Scaling Behavior:**
+
+- **Scale Up:** When CPU utilization > 60% or request queue > 10
+- **Scale Down:** After 5 minutes of low utilization (< 20% CPU)
+- **Cold Start Mitigation:** Min 2 instances always warm
+- **Target Concurrency:** 80 requests per instance (leaves headroom)
+
+---
+
+### Cloud SQL PostgreSQL
+
+**Instance Configuration:**
+
+```yaml
+name: url-shortener-db-primary
+database_version: POSTGRES_15
+region: us-central1
+tier: db-custom-2-8192  # 2 vCPU, 8GB RAM
+
+settings:
+  availability_type: REGIONAL  # High availability with automatic failover
+  backup_configuration:
+    enabled: true
+    start_time: "03:00"
+    location: us-central1
+    point_in_time_recovery_enabled: true
+    transaction_log_retention_days: 7
+    backup_retention_settings:
+      retained_backups: 7
+      retention_unit: COUNT
+  
+  ip_configuration:
+    ipv4_enabled: false  # No public IP
+    private_network: projects/PROJECT/global/networks/url-shortener-vpc
+    require_ssl: true
+  
+  database_flags:
+    - name: max_connections
+      value: "200"
+    - name: shared_buffers
+      value: "2097152"  # 2GB in 8KB pages
+    - name: effective_cache_size
+      value: "6291456"  # 6GB in 8KB pages
+    - name: maintenance_work_mem
+      value: "524288"   # 512MB in KB
+    - name: checkpoint_completion_target
+      value: "0.9"
+    - name: wal_buffers
+      value: "2048"     # 16MB in 8KB pages
+    - name: default_statistics_target
+      value: "100"
+    - name: random_page_cost
+      value: "1.1"      # SSD-optimized
+    - name: effective_io_concurrency
+      value: "200"
+    - name: work_mem
+      value: "20480"    # 20MB in KB
+    - name: min_wal_size
+      value: "1024"     # 1GB in MB
+    - name: max_wal_size
+      value: "4096"     # 4GB in MB
+    - name: log_min_duration_statement
+      value: "1000"     # Log queries > 1s
+  
+  maintenance_window:
+    day: 7  # Sunday
+    hour: 2
+    update_track: stable
+  
+  insights_config:
+    query_insights_enabled: true
+    query_string_length: 1024
+    record_application_tags: true
+```
+
+**Database and User Setup:**
+
+```sql
+-- Create database
+CREATE DATABASE url_shortener
+    WITH 
+    ENCODING = 'UTF8'
+    LC_COLLATE = 'en_US.UTF-8'
+    LC_CTYPE = 'en_US.UTF-8
+## System Architecture
+# Architecture: URL Shortener Service
+
+## Goal
+
+Design a high-performance, scalable URL shortening system that prioritizes low-latency redirects and reliable URL shortening. The architecture follows microservices principles with separate services for write operations (URL shortening) and read operations (redirects) to optimize for the read-heavy traffic pattern. The system leverages caching extensively to meet aggressive latency requirements and uses GCP managed services for scalability and reliability.
+
+## Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        API_CLIENT[API Clients]
+        BROWSER[Web Browsers]
+    end
+
+    subgraph "Edge Layer"
+        LB[Cloud Load Balancer]
+        CDN[Cloud CDN - Optional]
+    end
+
+    subgraph "Application Layer - Cloud Run"
+        SHORTEN[Shortening Service<br/>Go + Chi<br/>Port 8080]
+        REDIRECT[Redirect Service<br/>Go + Chi<br/>Port 8081]
+    end
+
+    subgraph "Caching Layer"
+        REDIS[Memorystore Redis<br/>Cache Tier]
+    end
+
+    subgraph "Data Layer"
+        POSTGRES[(Cloud SQL PostgreSQL<br/>Primary)]
+        REPLICA[(Cloud SQL PostgreSQL<br/>Read Replica)]
+    end
+
+    subgraph "Observability"
+        LOGGING[Cloud Logging]
+        MONITORING[Cloud Monitoring]
+        TRACE[Cloud Trace]
+    end
+
+    API_CLIENT -->|POST /api/v1/shorten| LB
+    BROWSER -->|GET /{shortCode}| LB
+    
+    LB -->|/api/v1/*| SHORTEN
+    LB -->|/{shortCode}| REDIRECT
+    
+    SHORTEN -->|Write| POSTGRES
+    SHORTEN -->|Invalidate| REDIS
+    
+    REDIRECT -->|Read Cache| REDIS
+    REDIS -.->|Cache Miss| REDIRECT
+    REDIRECT -->|Read DB| REPLICA
+    REDIRECT -->|Write Back Cache| REDIS
+    
+    POSTGRES -->|Replicate| REPLICA
+    
+    SHORTEN --> LOGGING
+    REDIRECT --> LOGGING
+    SHORTEN --> MONITORING
+    REDIRECT --> MONITORING
+    SHORTEN --> TRACE
+    REDIRECT --> TRACE
+
+    style REDIRECT fill:#90EE90
+    style REDIS fill:#FFD700
+    style POSTGRES fill:#4169E1
+    style REPLICA fill:#6495ED
+```
+
+## Tech Stack Overview
+
+| Layer | Technology |
+|-------|------------|
+| Frontend | N/A (API-only service) |
+| Backend | Go 1.21+ with Chi v5 router |
+| Database | PostgreSQL 15 (Cloud SQL) |
+| Cache | Redis 7.0 (Memorystore) |
+| Cloud | GCP (Cloud Run, Cloud SQL, Memorystore, Cloud Load Balancer) |
+| Container | Docker with Cloud Run |
+| Repository | GitHub |
+| CI/CD | GitHub Actions |
+| Observability | Cloud Logging, Cloud Monitoring, Cloud Trace |
+
+## Services Overview
+
+| Service | Responsibility | Tech Stack | Port |
+|---------|----------------|------------|------|
+| shortening-service | URL shortening, validation, short code generation | Go 1.21 + Chi v5 | 8080 |
+| redirect-service | High-performance URL redirects with caching | Go 1.21 + Chi v5 | 8081 |
+
+---
+
+## Service: shortening-service
+
+### Responsibilities
+- Accept and validate long URLs via REST API
+- Generate unique, collision-free short codes
+- Store URL mappings in PostgreSQL
+- Invalidate cache entries when needed
+- Implement rate limiting to prevent abuse
+- Sanitize URLs to prevent injection attacks
+- Return shortened URLs to clients
+
+### Tech Stack
+- **Language**: Go 1.21+
+- **Framework**: Chi v5 (lightweight, fast HTTP router)
+- **Database**: PostgreSQL 15 (Cloud SQL)
+- **Cache**: Redis 7.0 (Memorystore) - for cache invalidation
+- **Libraries**:
+  - `go-chi/chi/v5` - HTTP router
+  - `jackc/pgx/v5` - PostgreSQL driver
+  - `go-redis/redis/v9` - Redis client
+  - `google.golang.org/api/idtoken` - Authentication (future)
+  - `golang.org/x/time/rate` - Rate limiting
+
+### Mapped Requirements
+- **FR-001**: URL Shortening API - Primary implementation
+- **FR-003**: URL Validation - Input validation middleware
+- **FR-004**: Short Code Generation - Unique ID generation algorithm
+- **FR-005**: Persistent Storage - PostgreSQL writes
+- **NFR Performance**: < 200ms p99 latency for shortening
+- **NFR Scalability**: Horizontal scaling via Cloud Run
+- **NFR Security**: Input sanitization, rate limiting, HTTPS enforcement
+
+### API Endpoints
+
+#### POST /api/v1/shorten
+Request:
+```json
+{
+  "url": "https://example.com/very/long/url/path?query=params"
+}
+```
+
+Response (201 Created):
+```json
+{
+  "short_code": "aB3xY9",
+  "short_url": "https://short.link/aB3xY9",
+  "long_url": "https://example.com/very/long/url/path?query=params",
+  "created_at": "2024-01-15T10:30:00Z"
+}
+```
+
+Error Response (400 Bad Request):
+```json
+{
+  "error": "invalid_url",
+  "message": "URL must start with http:// or https://"
+}
+```
+
+Error Response (429 Too Many Requests):
+```json
+{
+  "error": "rate_limit_exceeded",
+  "message": "Too many requests. Please try again later.",
+  "retry_after": 60
+}
+```
+
+### Short Code Generation Algorithm
+
+**Approach**: Snowflake-inspired distributed ID generation + Base62 encoding
+
+```
+Components:
+- Timestamp (41 bits): Milliseconds since epoch
+- Worker ID (10 bits): Cloud Run instance identifier
+- Sequence (12 bits): Counter for same millisecond
+
+Result: 63-bit unique integer → Base62 encode → 6-8 character string
+```
+
+**Base62 Character Set**: `0-9a-zA-Z` (62 characters)
+
+### Database Schema
+
+```sql
+CREATE TABLE url_mappings (
+    id BIGSERIAL PRIMARY KEY,
+    short_code VARCHAR(8) UNIQUE NOT NULL,
+    long_url TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    created_by_ip INET,
+    
+    -- Indexes
+    CONSTRAINT short_code_length CHECK (char_length(short_code) BETWEEN 6 AND 8)
+);
+
+CREATE INDEX idx_short_code ON url_mappings(short_code);
+CREATE INDEX idx_created_at ON url_mappings(created_at DESC);
+```
+
+### Dependencies
+- PostgreSQL (Cloud SQL) - Primary data store
+- Redis (Memorystore) - Cache invalidation
+- Cloud Logging - Structured logging
+- Cloud Monitoring - Metrics export
+- Cloud Trace - Distributed tracing
+
+### Integrations
+- **Database**: Direct connection to Cloud SQL via private IP
+- **Cache**: Connection to Memorystore Redis via VPC
+- **Load Balancer**: Receives traffic on `/api/v1/*` paths
+- **Monitoring**: Exports metrics to Cloud Monitoring
+
+### Rate Limiting Strategy
+- **Per IP**: 100 requests per minute
+- **Global**: 1,000 requests per second (handled by auto-scaling)
+- **Implementation**: Token bucket algorithm with Redis backing
+
+### Acceptance Criteria
+- [ ] API accepts valid HTTP/HTTPS URLs
+- [ ] API rejects malformed URLs with appropriate error messages
+- [ ] API rejects empty or missing URL field
+- [ ] Short codes are 6-8 alphanumeric characters
+- [ ] Short codes are unique (no collisions)
+- [ ] URL mappings persist in PostgreSQL
+- [ ] Response includes short_code, short_url, and long_url
+- [ ] P99 latency < 200ms under load
+- [ ] Rate limiting prevents abuse (429 responses)
+- [ ] Input sanitization prevents SQL injection
+- [ ] HTTPS enforced for all endpoints
+- [ ] Handles 1,000 requests/second with auto-scaling
+- [ ] Graceful error handling for database failures
+- [ ] Structured logs exported to Cloud Logging
+- [ ] Metrics exported to Cloud Monitoring
+- [ ] Health check endpoint responds at `/health`
+
+---
+
+## Service: redirect-service
+
+### Responsibilities
+- Accept requests with short codes
+- Perform high-speed cache lookups
+- Query database on cache misses
+- Execute HTTP 301 redirects to original URLs
+- Populate cache with frequently accessed URLs
+- Return 404 for invalid short codes
+- Achieve < 50ms p99 latency
+
+### Tech Stack
+- **Language**: Go 1.21+
+- **Framework**: Chi v5 (minimal overhead for redirects)
+- **Database**: PostgreSQL 15 (Cloud SQL Read Replica)
+- **Cache**: Redis 7.0 (Memorystore) - primary data source
+- **Libraries**:
+  - `go-chi/chi/v5` - HTTP router
+  - `jackc/pgx/v5` - PostgreSQL driver
+  - `go-redis/redis/v9` - Redis client with pipelining
+
+### Mapped Requirements
+- **FR-002**: URL Redirect - Primary implementation
+- **FR-005**: Persistent Storage - Read from PostgreSQL replica
+- **NFR Performance**: < 50ms p99 latency for redirects
+- **NFR Scalability**: Handles 10,000 requests/second
+- **NFR Availability**: 99.9% uptime, higher priority than shortening
+
+### API Endpoints
+
+#### GET /{shortCode}
+Response (301 Moved Permanently):
+```
+HTTP/1.1 301 Moved Permanently
+Location: https://example.com/very/long/url/path?query=params
+Cache-Control: public, max-age=300
+```
+
+Response (404 Not Found):
+```json
+{
+  "error": "not_found",
+  "message": "Short code not found"
+}
+```
+
+### Caching Strategy
+
+**Cache Structure** (Redis):
+```
+Key: "url:{shortCode}"
+Value: "{longUrl}"
+TTL: 3600 seconds (1 hour)
+```
+
+**Cache-Aside Pattern**:
+1. Check Redis for `url:{shortCode}`
+2. If found (cache hit): Return URL and redirect
+3. If not found (cache miss):
+   - Query PostgreSQL read replica
+   - If found: Store in Redis with TTL, then redirect
+   - If not found: Return 404
+
+**Cache Warming**: Most popular URLs stay cached due to access frequency
+
+**Cache Invalidation**: Handled by shortening-service (not required for current scope)
+
+### Read Flow Optimization
+
+```
+Request → Parse shortCode (0.1ms)
+       → Redis GET (1-2ms typical)
+       → [Cache Hit 95%+] → Redirect (total: ~3-5ms)
+       → [Cache Miss 5%-] → PostgreSQL Query (5-10ms)
+                          → Redis SET (1-2ms)
+                          → Redirect (total: ~15-20ms)
+```
+
+### Database Schema (Read-Only Access)
+
+```sql
+-- Same schema as shortening-service, read from replica
+-- Read replica provides:
+-- - Reduced load on primary database
+-- - Lower latency for geographically distributed reads
+-- - High availability if primary fails
+```
+
+### Dependencies
+- PostgreSQL Read Replica (Cloud SQL) - Fallback data source
+- Redis (Memorystore) - Primary data source for hot paths
+- Cloud Load Balancer - Traffic distribution
+- Cloud Logging - Request logging
+- Cloud Monitoring - Performance metrics
+- Cloud Trace - Latency analysis
+
+### Integrations
+- **Cache**: Primary dependency via VPC connection to Memorystore
+- **Database**: Read-only connection to Cloud SQL replica via private IP
+- **Load Balancer**: Receives traffic on `/{shortCode}` paths
+- **Monitoring**: Real-time latency metrics to Cloud Monitoring
+
+### Performance Optimizations
+- **Connection Pooling**: Maintain persistent connections to Redis and PostgreSQL
+- **Minimal Allocations**: Reuse buffers, avoid unnecessary string operations
+- **Fast Path**: Cache hits bypass database entirely
+- **Async Logging**: Non-blocking log writes
+- **HTTP/2**: Multiplexing for concurrent requests
+- **Keep-Alive**: Connection reuse
+
+### Acceptance Criteria
+- [ ] Accepts short code in URL path (e.g., `/aB3xY9`)
+- [ ] Returns 301 redirect to original URL
+- [ ] Returns 404 for invalid/non-existent short codes
+- [ ] P99 latency < 50ms under load
+- [ ] P50 latency < 10ms (cache hits)
+- [ ] Cache hit rate > 95% for steady-state traffic
+- [ ] Handles 10,000 requests/second with auto-scaling
+- [ ] Reads from PostgreSQL replica on cache miss
+- [ ] Populates Redis cache on database reads
+- [ ] Graceful degradation if Redis unavailable (fallback to DB)
+- [ ] Health check endpoint responds at `/health`
+- [ ] Readiness check validates Redis and DB connectivity
+- [ ] Structured logs exported to Cloud Logging
+- [ ] Latency metrics exported to Cloud Monitoring
+- [ ] Distributed traces capture end-to-end flow
+
+---
+
+## Infrastructure
+
+### GCP Resources
+
+#### Cloud Run Services
+```yaml
+shortening-service:
+  region: us-central1
+  min_instances: 2
+  max_instances: 100
+  cpu: 1
+  memory: 512Mi
+  concurrency: 80
+  timeout: 10s
+  
+redirect-service:
+  region: us-central1
+  min_instances: 5
+  max_instances: 500
+  cpu: 1
+  memory: 256Mi
+  concurrency: 250
+  timeout: 5s
+```
+
+#### Cloud SQL (PostgreSQL 15)
+```yaml
+primary:
+  tier: db-custom-2-8192  # 2 vCPU, 8GB RAM
+  region: us-central1
+  high_availability: true
+  backup:
+    enabled: true
+    start_time: "03:00"
+    retention_days: 7
+  flags:
+    max_connections: 200
+    shared_buffers: 2GB
+    
+read_replica:
+  tier: db-custom-2-8192
+  region: us-central1
+  replica_count: 2
+```
+
+#### Memorystore Redis (7.0)
+```yaml
+redis:
+  tier: STANDARD_HA  # High availability
+  memory_size_gb: 5
+  region: us-central1
+  replica_count: 1
+  persistence: RDB
+  eviction_policy: allkeys-lru
+```
+
+#### Cloud Load Balancer
+```yaml
+load_balancer:
+  type: HTTPS
+  protocol: HTTP/2
+  backend_services:
+    - name: shortening-backend
+      path_matcher: /api/v1/*
+      target: shortening-service
+      timeout: 10s
+    - name: redirect-backend
+      path_matcher: /*
+      target: redirect-service
+      timeout: 5s
+  ssl_certificates:
+    - managed_certificate: short.link
+```
+
+#### VPC Network
+```yaml
+vpc:
+  name: url-shortener-vpc
+  subnet:
+    name: url-shortener-subnet
+    region: us-central1
+    ip_range: 10.0.0.0/24
+  
+  serverless_vpc_access:
+    connector: url-shortener-connector
+    ip_range: 10.1.0.0/28
+    min_instances: 2
+    max_instances: 10
+```
+
+#### Cloud Monitoring & Logging
+```yaml
+monitoring:
+  dashboards:
+    - name: URL Shortener Overview
+      widgets:
+        - request_rate
+        - latency_p50_p99
+        - error_rate
+        - cache_hit_rate
+        
+  alerts:
+    - name: High Latency
+      condition: p99 > 100ms for 5 minutes
+      notification: pagerduty
+    
+    - name: High Error Rate
+      condition: error_rate > 1% for 5 minutes
+      notification: pagerduty
+    
+    - name: Low Cache Hit Rate
+      condition: cache_hit_rate < 90% for 10 minutes
+      notification: slack
+
+logging:
+  retention_days: 30
+  log_sinks:
+    - name: error-logs
+      filter: severity >= ERROR
+      destination: bigquery
+```
+
+### Networking
+
+**Traffic Flow**:
+1. Client requests hit Cloud Load Balancer (HTTPS)
+2. Load Balancer terminates SSL
+3. Routes to appropriate Cloud Run service based on path:
+   - `/api/v1/*` → shortening-service
+   - `/{shortCode}` → redirect-service
+4. Services connect to Redis/PostgreSQL via Serverless VPC Connector
+5. Private IP communication within VPC (no public internet)
+
+**Security**:
+- Cloud Load Balancer: HTTPS only, managed SSL certificates
+- Cloud Run: Ingress from load balancer only
+- Cloud SQL: Private IP only, no public access
+- Memorystore: VPC-native, no public access
+- IAM: Service accounts with least-privilege permissions
+
+**DNS Configuration**:
+```
+short.link → Cloud Load Balancer IP
+```
+
+### Disaster Recovery
+
+**Backup Strategy**:
+- Cloud SQL: Automated daily backups, 7-day retention
+- Point-in-time recovery available
+- Read replicas provide redundancy
+
+**Failover**:
+- Cloud SQL: Automatic failover to standby (HA configuration)
+- Memorystore: Automatic failover to replica
+- Cloud Run: Multi-zone deployment with auto-healing
+
+**Recovery Objectives**:
+- RTO (Recovery Time Objective): < 5 minutes
+- RPO (Recovery Point Objective): < 1 minute
+
+---
+
+## Data Flow Diagrams
+
+### URL Shortening Flow
+```
+┌─────────┐
+│ Client  │
+└────┬────┘
+     │ POST /api/v1/shorten
+     │ {"url": "https://..."}
+     ▼
+┌─────────────────────┐
+│  Load Balancer      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│ Shortening Service  │
+│  1. Validate URL    │
+│  2. Check rate limit│
+│  3. Generate code   │
+│  4. Store in DB     │
+└──────────┬──────────┘
+           │
+           ├─────────────────┐
+           │                 │
+           ▼                 ▼
+    ┌──────────┐      ┌──────────┐
+    │PostgreSQL│      │  Redis   │
+    │ (Primary)│      │(Optional)│
+    └──────────┘      └──────────┘
+           │
+           │ Return short_code
+           ▼
+     ┌─────────┐
+     │ Client  │
+     └─────────┘
+```
+
+### URL Redirect Flow (Cache Hit)
+```
+┌─────────┐
+│ Browser │
+└────┬────┘
+     │ GET /aB3xY9
+     ▼
+┌─────────────────────┐
+│  Load Balancer      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Redirect Service   │
+│  1. Parse code      │
+│  2. Check Redis     │
+│  3. Cache HIT! ✓    │
+│  4. Return 301      │
+└──────────┬──────────┘
+           │
+           ▼ GET url:aB3xY9
+    ┌──────────┐
+    │  Redis   │ Returns: "https://..."
+    └──────────┘
+           │
+           │ 301 Location: https://...
+           ▼
+     ┌─────────┐
+     │ Browser │ → Redirects to original URL
+     └─────────┘
+```
+
+### URL Redirect Flow (Cache Miss)
+```
+┌─────────┐
+│ Browser │
+└────┬────┘
+     │ GET /aB3xY9
+     ▼
+┌─────────────────────┐
+│  Load Balancer      │
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────┐
+│  Redirect Service   │
+│  1. Parse code      │
+│  2. Check Redis     │
+│  3. Cache MISS ✗    │
+│  4. Query DB        │
+│  5. Store in Redis  │
+│  6. Return 301      │
+└──────────┬──────────┘
+           │
+           ├────────────┐
+           │            │
+           ▼            ▼
+    ┌──────────┐  ┌──────────┐
+    │  Redis   │  │PostgreSQL│
+    │  (Empty) │  │ (Replica)│
+    └──────────┘  └─────┬────┘
+           ▲            │
+           │            │ Returns URL
+           │            ▼
+           │      ┌──────────┐
+           │      │ Service  │
+           └──────┤ SET url  │
+                  └──────────┘
+           │
+           │ 301 Location: https://...
+           ▼
+     ┌─────────┐
+     │ Browser │ → Redirects to original URL
+     └─────────┘
+```
+
+---
+
+## Observability Strategy
+
+### Logging
+
+**Structured Logging Format** (JSON):
+```json
+{
+  "timestamp": "2024-01-15T10:30:00.123Z",
+  "severity": "INFO",
+  "service": "redirect-service",
+  "trace": "projects/PROJECT/traces/TRACE_ID",
+  "request_id": "req-abc123",
+  "method": "GET",
+  "path": "/aB3xY9",
+  "status": 301,
+  "latency_ms": 3.2,
+  "cache_hit": true,
+  "short_code": "aB3xY9"
+}
+```
+
+**Log Levels**:
+- ERROR: Failed requests, database errors, cache failures
+- WARN: Rate limit hits, validation failures
+- INFO: Successful requests (sampled at 1% for redirects)
+- DEBUG: Detailed debugging (disabled in production)
+
+### Metrics
+
+**Key Metrics** (exported to Cloud Monitoring):
+
+**Shortening Service**:
+- `shortening_requests_total` (counter) - Total shortening requests
+- `shortening_latency_seconds` (histogram) - Request latency distribution
+- `shortening_errors_total` (counter) - Failed requests by error type
+- `rate_limit_hits_total` (counter) - Rate limit rejections
+- `short_codes_generated_total` (counter) - Successful code generations
+
+**Redirect Service**:
+- `redirect_requests_total` (counter) - Total redirect requests
+- `redirect_latency_seconds` (histogram) - Request latency distribution
+- `redirect_errors_total` (counter) - Failed redirects (404s)
+- `cache_hit_total` (counter) - Redis cache hits
+- `cache_miss_total` (counter) - Redis cache misses
+- `cache_hit_rate` (gauge) - Cache hit rate percentage
+- `db_query_latency_seconds` (histogram) - Database query latency
+
+**Infrastructure**:
+- `redis_connections_active` (gauge) - Active Redis connections
+- `db_connections_active` (gauge) - Active database connections
+- `cloud_run_instance_count` (gauge) - Number of running instances
+
+### Tracing
+
+**Cloud Trace Integration**:
+- Trace all requests end-to-end
+- Instrument critical paths:
+  - HTTP request handling
+  - Redis operations
+  - PostgreSQL queries
+  - Short code generation
+
+**Trace Sampling**:
+- 100% for requests > 100ms
+- 10% for normal requests
+- Always trace errors
+
+### Dashboards
+
+**Main Dashboard** (Cloud Monitoring):
+1. **Traffic Overview**
+   - Request rate (shortening vs redirect)
+   - Success rate
+   - Error rate by type
+
+2. **Latency**
+   - P50, P95, P99 latency for both services
+   - Latency by cache hit/miss
+
+3. **Cache Performance**
+   - Cache hit rate
+   - Cache miss rate
+   - Redis connection pool usage
+
+4. **Database**
+   - Query latency
+   - Connection pool usage
+   - Replication lag
+
+5. **Infrastructure**
+   - Cloud Run instance count
+   - CPU utilization
+   - Memory utilization
+
+### Alerting Rules
+
+| Alert | Condition | Severity | Action |
+|-------|-----------|----------|--------|
+| High Redirect Latency | P99 > 50ms for 5 min | Critical | Page on-call |
+| High Shortening Latency | P99 > 200ms for 5 min | Warning | Slack notification |
+| Low Cache Hit Rate | < 90% for 10 min | Warning | Investigate Redis |
+| High Error Rate | > 1% for 5 min | Critical | Page on-call |
+| Database Replication Lag | > 10 seconds | Warning | Check replica health |
+| Service Down | Health check fails | Critical | Page on-call |
+| Redis Connection Failure | Connection errors | Critical | Page on-call |
+
+---
+
+## Security Architecture
+
+### Authentication & Authorization
+- **Current Scope**: No authentication required (public API)
+- **Future**: API key authentication for shortening endpoint
+- **Service-to-Service**: Service accounts with IAM roles
+
+### Input Validation
+```go
+// URL Validation Rules
+- Must start with http:// or https://
+- Must have valid domain
+- Maximum length: 2048 characters
+- No javascript:, data:, or file: schemes
+- Domain must resolve to valid DNS
+```
+
+### Rate Limiting
+```yaml
+Per IP Address:
+  shortening: 100 requests/minute
+  redirect: 1000 requests/minute
+
+Global:
+  shortening: 1000 requests/second
+  redirect: 10000 requests/second
+
+Implementation:
+  - Token bucket algorithm
+  - Redis-backed for distributed rate limiting
+  - Return 429 with Retry-After header
+```
+
+### Security Headers
+```
+Strict-Transport-Security: max-age=31536000; includeSubDomains
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+X-XSS-Protection: 1; mode=block
+```
+
+### Data Protection
+- **In Transit**: TLS 1.3 for all external communication
+- **At Rest**: Cloud SQL encryption enabled by default
+- **Redis**: AUTH password protection, VPC isolation
+
+### Abuse Prevention
+1. **Rate Limiting**: Prevent spam and DoS attacks
+2. **URL Validation**: Prevent malicious URL injection
+3. **Monitoring**: Alert on suspicious patterns
+4. **Future**: URL blacklist/reputation checking
+
+---
+
+## Deployment Strategy
+
+### CI/CD Pipeline (GitHub Actions)
+
+```yaml
+# .github/workflows/deploy.yml
+
+name: Deploy URL Shortener
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      - run: go test ./...
+      - run: go vet ./...
+      
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: gcr.io/${{ secrets.GCP_PROJECT }}/shortening-service:${{ github.sha }}
+      
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: google-github-actions/deploy-cloudrun@v1
+        with:
+          service: shortening-service-staging
+          image: gcr.io/${{ secrets.GCP_PROJECT }}/shortening-service:${{ github.sha }}
+          
+  deploy-production:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: google-github-actions/deploy-cloudrun@v1
+        with:
+          service: shortening-service
+          image: gcr.io/${{ secrets.GCP_PROJECT }}/shortening-service:${{ github.sha }}
+```
+
+### Deployment Phases
+
+**Phase 1: Infrastructure Setup**
+1. Create VPC network and subnets
+2. Provision Cloud SQL (primary + replica)
+3. Provision Memorystore Redis
+4. Configure Serverless VPC Connector
+5. Set up Cloud Load Balancer
+6. Configure DNS
+
+**Phase 2: Service Deployment**
+1. Deploy shortening-service to Cloud Run (staging)
+2. Deploy redirect-service to Cloud Run (staging)
+3. Run integration tests
+4. Deploy to production with traffic split (10% → 50% → 100%)
+
+**Phase 3: Monitoring & Optimization**
+1. Validate metrics and alerts
+2. Load testing
+3. Performance tuning
+4. Cache warming
+
+### Rollback Strategy
+- **Cloud Run**: Instant rollback to previous revision
+- **Database**: Restore from backup if needed
+- **Traffic**: Gradual traffic shifting allows quick rollback
+
+---
+
+## Testing Strategy
+
+### Unit Tests
+- Service logic (URL validation, short code generation)
+- Database operations (mocked)
+- Cache operations (mocked)
+- Target: 80% code coverage
+
+### Integration Tests
+- End-to-end API tests
+- Database integration
+- Redis integration
+- Error scenarios
+
+### Load Tests
+```yaml
+Shortening Service:
+  - Target: 1,000 req/s sustained
+  - Duration: 10 minutes
+  - Success rate: > 99%
+  - P99 latency: < 200ms
+
+Redirect Service:
+  - Target: 10,000 req/s sustained
+  - Duration: 30 minutes
+  - Success rate: > 99.9%
+  - P99 latency: < 50ms
+  - Cache hit rate: > 95%
+```
+
+### Chaos Testing
+- Redis failure scenarios
+- Database failover
+- Network latency injection
+- Pod termination
+
+---
+
+## Cost Estimation
+
+### Monthly Cost Breakdown (Estimated)
+
+| Resource | Configuration | Estimated Cost |
+|----------|--------------|----------------|
+| Cloud Run (Shortening) | 2-100 instances, 1 vCPU, 512Mi | $50-200 |
+| Cloud Run (Redirect) | 5-500 instances, 1 vCPU, 256Mi | $100-500 |
+| Cloud SQL (Primary) | db-custom-2-8192, HA | $350 |
+| Cloud SQL (Replicas) | 2x db-custom-2-8192 | $500 |
+| Memorystore Redis | 5GB, HA | $150 |
+| Cloud Load Balancer | HTTPS, 2 backends | $20 |
+| VPC Connector | 2-10 instances | $30 |
+| Cloud Logging | 30 days retention | $50 |
+| Cloud Monitoring | Metrics & alerts | $20 |
+| **Total** | | **$1,270-1,820/month** |
+
+**Cost Optimization Opportunities**:
+- Use committed use discounts for predictable load
+- Optimize Cloud Run min instances based on traffic patterns
+- Implement log sampling for high-volume endpoints
+- Consider Cloud SQL shared-core instances for development
+
+---
+
+## Implementation Checklist
+
+### Infrastructure Setup
+- [ ] Create GCP project and enable required APIs
+- [ ] Set up VPC network and subnets
+- [ ] Provision Cloud SQL PostgreSQL (primary + HA)
+- [ ] Provision Cloud SQL read replicas (2x)
+- [ ] Provision Memorystore Redis (HA)
+- [ ] Configure Serverless VPC Connector
+- [ ] Set up Cloud Load Balancer with SSL
+- [ ] Configure DNS for short domain
+- [ ] Set up Cloud Monitoring workspace
+- [ ] Configure Cloud Logging sinks
+
+### Shortening Service Implementation
+- [ ] Initialize Go project with Chi framework
+- [ ] Implement URL validation middleware
+- [ ] Implement rate limiting middleware
+- [ ] Implement short code generation (Snowflake-based)
+- [ ] Implement PostgreSQL connection pool
+- [ ] Implement Redis client for cache invalidation
+- [ ] Create POST /api/v1/shorten endpoint
+- [ ] Create GET /health endpoint
+- [ ] Add structured logging
+- [ ] Add metrics instrumentation
+## Product Requirements
+# PRD: URL Shortener Service
+
+## Problem Statement
+
+Long URLs are difficult to share, remember, and use in contexts with character limits (SMS, social media, print materials). Users need a simple, fast way to convert lengthy URLs into short, manageable links that reliably redirect to the original destination. This problem affects marketers, developers, content creators, and everyday users who frequently share links.
+
+## Goals & Success Metrics
+
+- Goal 1: Enable fast and reliable URL shortening
+  - Metric: 99th percentile API response time < 100ms for shortening requests
+- Goal 2: Provide instant and reliable redirects
+  - Metric: 99th percentile redirect latency < 50ms
+- Goal 3: Ensure high system availability
+  - Metric: 99.9% uptime for redirect service
+
+## Target Users
+
+### Persona 1: Developer
+
+- Characteristics: Integrates URL shortening into applications via API, values simplicity and reliability
+- Pain points: Complex APIs, poor documentation, unreliable services, slow response times
+
+### Persona 2: End User
+
+- Characteristics: Needs to shorten URLs for sharing via messaging or social platforms
+- Pain points: Long URLs that break in messages, hard to remember links, slow redirect times
+
+## User Stories
+
+### US-001: Shorten a URL
+
+As a user, I want to submit a long URL so that I receive a shortened URL I can share.
+
+**Acceptance Criteria:**
+
+- [ ] System accepts a valid URL via API
+- [ ] System returns a unique short code
+- [ ] System returns the complete shortened URL
+- [ ] Response time is under 200ms
+
+### US-002: Redirect to Original URL
+
+As a user, I want to access a shortened URL so that I am redirected to the original destination.
+
+**Acceptance Criteria:**
+
+- [ ] System accepts short code in URL path
+- [ ] System performs HTTP 301/302 redirect to original URL
+- [ ] Redirect happens within 100ms
+- [ ] Invalid short codes return 404 error
+
+### US-003: Validate Input URL
+
+As a system, I want to validate submitted URLs so that only properly formatted URLs are shortened.
+
+**Acceptance Criteria:**
+
+- [ ] System rejects malformed URLs
+- [ ] System rejects empty inputs
+- [ ] System returns appropriate error messages
+
+## Functional Requirements
+
+### FR-001: URL Shortening API
+
+The system shall provide an API endpoint that accepts a long URL and returns a shortened URL with a unique short code (6-8 alphanumeric characters).
+
+### FR-002: URL Redirect
+
+The system shall redirect requests to shortened URLs (via short code) to the original long URL using HTTP 301 (permanent) redirect.
+
+### FR-003: URL Validation
+
+The system shall validate that submitted URLs are properly formatted with a valid scheme (http/https) before processing.
+
+### FR-004: Short Code Generation
+
+The system shall generate unique, collision-free short codes using base62 encoding or similar algorithm.
+
+### FR-005: Persistent Storage
+
+The system shall store URL mappings (short code → long URL) in a persistent data store.
+
+## Non-Functional Requirements
+
+### Performance
+
+- URL shortening requests must complete in < 200ms (p99)
+- Redirect requests must complete in < 50ms (p99)
+- System must handle 1,000 shortening requests per second
+- System must handle 10,000 redirect requests per second
+
+### Scalability
+
+- System must scale horizontally to handle increased load
+- Database must support sharding for future growth
+
+### Security
+
+- Input URLs must be sanitized to prevent injection attacks
+- Rate limiting must be implemented to prevent abuse
+- HTTPS must be enforced for all API endpoints
+
+### Availability
+
+- System must maintain 99.9% uptime
+- Redirect service must have higher priority than shortening service during degradation
+
+## Scope
+
+### In Scope
+
+- REST API for URL shortening
+- HTTP redirect service
+- URL validation
+- Short code generation
+- Persistent storage of URL mappings
+
+### Out of Scope
+
+- User authentication/accounts
+- Analytics and click tracking
+- Custom short codes/aliases
+- Link expiration
+- QR code generation
+- Web UI/frontend
+
+## Dependencies & Integrations
+
+- Database system (PostgreSQL, Redis, or similar)
+- Load balancer for traffic distribution
+- DNS configuration for short domain
+
+## Assumptions & Constraints
+
+### Assumptions
+
+- Short domain has been acquired and configured
+- Infrastructure (servers, database) is available
+- Traffic will be primarily read-heavy (more redirects than shortening)
+
+### Constraints
+
+- Short codes limited to 6-8 characters
+- Only http:// and https:// URLs supported
+- No support for URL modification after creation
+
+## Risks & Mitigations
+
+| Risk | Impact | Likelihood | Mitigation |
+|------|--------|------------|------------|
+| Short code collision | High | Low | Use proven unique ID generation (Snowflake, UUID-based) |
+| Database failure | High | Low | Implement read replicas and caching layer |
+| Abuse/spam | Medium | Medium | Implement rate limiting and URL blacklisting |
+| High redirect latency | Medium | Medium | Use in-memory caching (Redis) for hot URLs |
+
+## Release Criteria
+
+- [ ] URL shortening API functional and tested
+- [ ] Redirect service functional and tested
+- [ ] Performance benchmarks met (latency, throughput)
+- [ ] Database persistence verified
+- [ ] Error handling implemented for edge cases
+- [ ] Load testing completed successfully
+- [ ] API documentation complete
+
+
+---
+
+# Instructions
+Please implement the task described above following the specifications and acceptance criteria. Ensure all code follows best practices, includes proper error handling, and meets the acceptance criteria listed in the task.
